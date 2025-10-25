@@ -11,10 +11,10 @@ use reqwest::header::{
 use reqwest::{Client, RequestBuilder as ReqwestRequestBuilder, Url};
 use tracing::instrument;
 
+use super::context_properties::ContextProperties;
 use super::multipart::Multipart;
 use super::routing::Route;
 use super::{HttpError, LightMethod};
-use crate::constants;
 use crate::internal::prelude::*;
 
 #[deprecated = "use Request directly now"]
@@ -29,6 +29,7 @@ pub struct Request<'a> {
     pub(super) method: LightMethod,
     pub(super) route: Route<'a>,
     pub(super) params: Option<Vec<(&'static str, String)>>,
+    pub(super) context_properties: Option<ContextProperties>,
 }
 
 impl<'a> Request<'a> {
@@ -40,6 +41,7 @@ impl<'a> Request<'a> {
             method,
             route,
             params: None,
+            context_properties: None,
         }
     }
 
@@ -63,13 +65,20 @@ impl<'a> Request<'a> {
         self
     }
 
+    pub fn context_properties(mut self, context_properties: Option<ContextProperties>) -> Self {
+        self.context_properties = context_properties;
+        self
+    }
+
     #[allow(clippy::missing_errors_doc)]
-    #[instrument(skip(token))]
+    #[instrument(skip(token, super_properties_encoded))]
     pub fn build(
         self,
         client: &Client,
         token: &str,
         proxy: Option<&str>,
+        super_properties_encoded: &str,
+        user_agent: &str,
     ) -> Result<ReqwestRequestBuilder> {
         let mut path = self.route.path().to_string();
 
@@ -89,9 +98,29 @@ impl<'a> Request<'a> {
             .request(self.method.reqwest_method(), Url::parse(&path).map_err(HttpError::Url)?);
 
         let mut headers = self.headers.unwrap_or_default();
-        headers.insert(USER_AGENT, HeaderValue::from_static(constants::USER_AGENT));
+
+        // Use the SuperProperties user agent instead of the static one
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(user_agent).map_err(HttpError::InvalidHeader)?,
+        );
         headers
             .insert(AUTHORIZATION, HeaderValue::from_str(token).map_err(HttpError::InvalidHeader)?);
+
+        // Add X-Super-Properties header for all authenticated requests
+        headers.insert(
+            "X-Super-Properties",
+            HeaderValue::from_str(super_properties_encoded).map_err(HttpError::InvalidHeader)?,
+        );
+
+        // Add X-Context-Properties header if context_properties is set
+        if let Some(context_props) = self.context_properties {
+            let encoded = context_props.encode();
+            headers.insert(
+                "X-Context-Properties",
+                HeaderValue::from_str(&encoded).map_err(HttpError::InvalidHeader)?,
+            );
+        }
 
         if let Some(multipart) = self.multipart {
             // Setting multipart adds the content-length header.

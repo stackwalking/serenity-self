@@ -14,10 +14,12 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use tracing::{debug, instrument, warn};
 
+use super::context_properties::ContextProperties;
 use super::multipart::{Multipart, MultipartUpload};
 use super::ratelimiting::Ratelimiter;
 use super::request::Request;
 use super::routing::Route;
+use super::super_properties::SuperProperties;
 use super::typing::Typing;
 use super::{
     ErrorResponse,
@@ -58,6 +60,8 @@ pub struct HttpBuilder {
     proxy: Option<String>,
     application_id: Option<ApplicationId>,
     default_allowed_mentions: Option<CreateAllowedMentions>,
+    captcha_handler: Option<super::CaptchaHandler>,
+    super_properties: Option<SuperProperties>,
 }
 
 impl HttpBuilder {
@@ -72,6 +76,8 @@ impl HttpBuilder {
             proxy: None,
             application_id: None,
             default_allowed_mentions: None,
+            captcha_handler: None,
+            super_properties: None,
         }
     }
 
@@ -139,7 +145,28 @@ impl HttpBuilder {
         self
     }
 
+    /// Sets the CAPTCHA handler to be used when Discord requests CAPTCHA verification.
+    ///
+    /// The handler receives [`CaptchaRequiredData`] and must return a solved CAPTCHA token.
+    ///
+    /// [`CaptchaRequiredData`]: super::CaptchaRequiredData
+    pub fn captcha_handler(mut self, handler: super::CaptchaHandler) -> Self {
+        self.captcha_handler = Some(handler);
+        self
+    }
+
+    /// Sets the super properties to be used for requests.
+    ///
+    /// If not set, they will be fetched automatically when building.
+    pub fn super_properties(mut self, super_properties: SuperProperties) -> Self {
+        self.super_properties = Some(super_properties);
+        self
+    }
+
     /// Use the given configuration to build the `Http` client.
+    ///
+    /// This uses default/fallback SuperProperties. For automatic fetching of Discord's
+    /// current build number and browser version, use [`Self::build_async`].
     #[must_use]
     pub fn build(self) -> Http {
         let application_id = AtomicU64::new(self.application_id.map_or(0, ApplicationId::get));
@@ -154,6 +181,8 @@ impl HttpBuilder {
                 .unwrap_or_else(|| Ratelimiter::new(client.clone(), self.token.expose_secret()))
         });
 
+        let super_properties = self.super_properties.unwrap_or_default();
+
         Http {
             client,
             ratelimiter,
@@ -161,18 +190,51 @@ impl HttpBuilder {
             token: self.token,
             application_id,
             default_allowed_mentions: self.default_allowed_mentions,
+            captcha_handler: self.captcha_handler,
+            super_properties: Arc::new(super_properties),
         }
+    }
+
+    /// Asynchronously builds the `Http` client, fetching Discord's current build number
+    /// and browser version automatically.
+    ///
+    /// This is the recommended way to build the client for user accounts.
+    pub async fn build_async(self) -> Result<Http> {
+        let application_id = AtomicU64::new(self.application_id.map_or(0, ApplicationId::get));
+
+        let client = self.client.unwrap_or_else(|| {
+            let builder = configure_client_backend(Client::builder());
+            builder.build().expect("Cannot build reqwest::Client")
+        });
+
+        let ratelimiter = (!self.ratelimiter_disabled).then(|| {
+            self.ratelimiter
+                .unwrap_or_else(|| Ratelimiter::new(client.clone(), self.token.expose_secret()))
+        });
+
+        let super_properties = if let Some(props) = self.super_properties {
+            props
+        } else {
+            SuperProperties::fetch(&client).await?
+        };
+
+        Ok(Http {
+            client,
+            ratelimiter,
+            proxy: self.proxy,
+            token: self.token,
+            application_id,
+            default_allowed_mentions: self.default_allowed_mentions,
+            captcha_handler: self.captcha_handler,
+            super_properties: Arc::new(super_properties),
+        })
     }
 }
 
 fn parse_token(token: impl AsRef<str>) -> String {
-    let token = token.as_ref().trim();
-
-    if token.starts_with("Bot ") || token.starts_with("Bearer ") {
-        token.to_string()
-    } else {
-        format!("Bot {token}")
-    }
+    // For user accounts (self-bot), don't add any prefix
+    // The token should be sent as-is
+    token.as_ref().trim().to_string()
 }
 
 fn reason_into_header(reason: &str) -> Headers {
@@ -192,7 +254,6 @@ fn reason_into_header(reason: &str) -> Headers {
 
 /// **Note**: For all member functions that return a [`Result`], the Error kind will be either
 /// [`Error::Http`] or [`Error::Json`].
-#[derive(Debug)]
 pub struct Http {
     pub(crate) client: Client,
     pub ratelimiter: Option<Ratelimiter>,
@@ -200,6 +261,23 @@ pub struct Http {
     token: SecretString,
     application_id: AtomicU64,
     pub default_allowed_mentions: Option<CreateAllowedMentions>,
+    pub(crate) captcha_handler: Option<super::CaptchaHandler>,
+    pub(crate) super_properties: Arc<SuperProperties>,
+}
+
+impl std::fmt::Debug for Http {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Http")
+            .field("client", &self.client)
+            .field("ratelimiter", &self.ratelimiter)
+            .field("proxy", &self.proxy)
+            .field("token", &"<redacted>")
+            .field("application_id", &self.application_id)
+            .field("default_allowed_mentions", &self.default_allowed_mentions)
+            .field("captcha_handler", &self.captcha_handler.as_ref().map(|_| "<handler>"))
+            .field("super_properties", &self.super_properties)
+            .finish()
+    }
 }
 
 impl Http {
@@ -247,7 +325,7 @@ impl Http {
                     user_id,
                 },
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         if response.status() == 204 {
@@ -280,7 +358,7 @@ impl Http {
                 user_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -312,6 +390,7 @@ impl Http {
                 user_id,
             },
             params: Some(vec![("delete_message_seconds", delete_message_seconds.to_string())]),
+            context_properties: None,
         })
         .await
     }
@@ -335,7 +414,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -356,7 +435,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -385,7 +464,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -402,7 +481,7 @@ impl Http {
             method: LightMethod::Post,
             route: Route::StageInstances,
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -426,7 +505,7 @@ impl Http {
                 message_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -448,7 +527,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -483,7 +562,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -509,7 +588,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -528,7 +607,7 @@ impl Http {
                 application_id: self.try_application_id()?,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -551,7 +630,7 @@ impl Http {
                 token: interaction_token,
             },
             params: None,
-        };
+            context_properties: None,        };
 
         if files.is_empty() {
             request.body = Some(to_vec(map)?);
@@ -586,7 +665,7 @@ impl Http {
                 application_id: self.try_application_id()?,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -604,7 +683,7 @@ impl Http {
                 application_id: self.try_application_id()?,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -624,7 +703,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -670,7 +749,7 @@ impl Http {
             method: LightMethod::Post,
             route: Route::Guilds,
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -696,7 +775,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -725,7 +804,7 @@ impl Http {
                 integration_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -752,7 +831,7 @@ impl Http {
                 token: interaction_token,
             },
             params: None,
-        };
+            context_properties: None,        };
 
         if files.is_empty() {
             request.body = Some(to_vec(map)?);
@@ -794,6 +873,7 @@ impl Http {
                 channel_id,
             },
             params: None,
+            context_properties: Some(ContextProperties::random_invite_context()),
         })
         .await
     }
@@ -818,7 +898,7 @@ impl Http {
                 target_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -833,7 +913,7 @@ impl Http {
             method: LightMethod::Post,
             route: Route::UserMeDmChannels,
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -855,7 +935,7 @@ impl Http {
                 reaction: &reaction_type.as_data(),
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
     /// Creates a role.
@@ -875,7 +955,7 @@ impl Http {
                     guild_id,
                 },
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         if let Some(map) = value.as_object_mut() {
@@ -908,7 +988,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -937,7 +1017,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -976,7 +1056,7 @@ impl Http {
                 application_id: self.try_application_id()?,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1023,7 +1103,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1042,7 +1122,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1061,7 +1141,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1084,7 +1164,7 @@ impl Http {
                 emoji_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1100,7 +1180,7 @@ impl Http {
                 emoji_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1121,7 +1201,7 @@ impl Http {
                 message_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1137,7 +1217,7 @@ impl Http {
                 command_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1152,7 +1232,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1173,7 +1253,7 @@ impl Http {
                 command_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1194,7 +1274,7 @@ impl Http {
                 integration_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1213,7 +1293,7 @@ impl Http {
                 code,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1234,7 +1314,7 @@ impl Http {
                 message_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1254,7 +1334,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1291,7 +1371,7 @@ impl Http {
                 message_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1313,7 +1393,7 @@ impl Http {
                 reaction: &reaction_type.as_data(),
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1332,7 +1412,7 @@ impl Http {
                 token: interaction_token,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1353,7 +1433,7 @@ impl Http {
                 target_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1377,7 +1457,7 @@ impl Http {
                 reaction: &reaction_type.as_data(),
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1399,7 +1479,7 @@ impl Http {
                 reaction: &reaction_type.as_data(),
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1420,7 +1500,7 @@ impl Http {
                 role_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1445,7 +1525,7 @@ impl Http {
                 event_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1468,7 +1548,7 @@ impl Http {
                 sticker_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1485,7 +1565,7 @@ impl Http {
                 entitlement_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1522,7 +1602,7 @@ impl Http {
                 webhook_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1563,7 +1643,7 @@ impl Http {
                 token,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1585,7 +1665,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1605,7 +1685,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1631,7 +1711,7 @@ impl Http {
                 emoji_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1655,7 +1735,7 @@ impl Http {
                 emoji_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1682,7 +1762,7 @@ impl Http {
                 message_id,
             },
             params: None,
-        };
+            context_properties: None,        };
 
         if new_attachments.is_empty() {
             request.body = Some(to_vec(map)?);
@@ -1718,7 +1798,7 @@ impl Http {
                 message_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1744,7 +1824,7 @@ impl Http {
                 command_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1766,7 +1846,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1794,7 +1874,7 @@ impl Http {
                 command_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1822,7 +1902,7 @@ impl Http {
                 command_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1843,7 +1923,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1870,7 +1950,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
         .map(|mfa: GuildMfaLevel| mfa.level)
     }
@@ -1893,7 +1973,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1915,7 +1995,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -1940,7 +2020,7 @@ impl Http {
                     user_id,
                 },
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         if let Some(map) = value.as_object_mut() {
@@ -1970,7 +2050,7 @@ impl Http {
                 message_id,
             },
             params: None,
-        };
+            context_properties: None,        };
 
         if new_attachments.is_empty() {
             request.body = Some(to_vec(map)?);
@@ -2003,7 +2083,7 @@ impl Http {
                 message_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2025,7 +2105,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2050,7 +2130,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2072,7 +2152,7 @@ impl Http {
                 channel_id: news_channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2091,7 +2171,7 @@ impl Http {
                 token: interaction_token,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2116,7 +2196,7 @@ impl Http {
                 token: interaction_token,
             },
             params: None,
-        };
+            context_properties: None,        };
 
         if new_attachments.is_empty() {
             request.body = Some(to_vec(map)?);
@@ -2142,7 +2222,7 @@ impl Http {
             method: LightMethod::Patch,
             route: Route::UserMe,
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2165,7 +2245,7 @@ impl Http {
                     role_id,
                 },
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         if let Some(map) = value.as_object_mut() {
@@ -2199,7 +2279,7 @@ impl Http {
                     guild_id,
                 },
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         if let Some(array) = value.as_array_mut() {
@@ -2236,7 +2316,7 @@ impl Http {
                 event_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2263,7 +2343,7 @@ impl Http {
                     sticker_id,
                 },
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         if let Some(map) = value.as_object_mut() {
@@ -2289,7 +2369,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2339,7 +2419,7 @@ impl Http {
                 user_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2390,7 +2470,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2412,7 +2492,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2463,7 +2543,7 @@ impl Http {
                 webhook_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2511,7 +2591,7 @@ impl Http {
                 token,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2625,7 +2705,7 @@ impl Http {
                 token,
             },
             params: Some(params),
-        };
+            context_properties: None,        };
 
         if files.is_empty() {
             request.body = Some(to_vec(map)?);
@@ -2665,6 +2745,7 @@ impl Http {
                 message_id,
             },
             params: thread_id.map(|thread_id| vec![("thread_id", thread_id.to_string())]),
+            context_properties: None,
         })
         .await
     }
@@ -2690,6 +2771,7 @@ impl Http {
                 message_id,
             },
             params: thread_id.map(|thread_id| vec![("thread_id", thread_id.to_string())]),
+            context_properties: None,
         };
 
         if new_attachments.is_empty() {
@@ -2724,6 +2806,7 @@ impl Http {
                 message_id,
             },
             params: thread_id.map(|thread_id| vec![("thread_id", thread_id.to_string())]),
+            context_properties: None,
         })
         .await
     }
@@ -2746,7 +2829,7 @@ impl Http {
                 method: LightMethod::Get,
                 route: Route::StatusMaintenancesActive,
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         Ok(status.scheduled_maintenances)
@@ -2790,7 +2873,7 @@ impl Http {
                 guild_id,
             },
             params: Some(params),
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2816,7 +2899,7 @@ impl Http {
                     user_id,
                 },
                 params: None,
-            })
+            context_properties: None,            })
             .await;
 
         match result {
@@ -2860,7 +2943,7 @@ impl Http {
                 guild_id,
             },
             params: Some(params),
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2877,7 +2960,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2895,7 +2978,7 @@ impl Http {
                 rule_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2919,7 +3002,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2945,7 +3028,7 @@ impl Http {
                 rule_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2968,7 +3051,7 @@ impl Http {
                 rule_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2981,7 +3064,7 @@ impl Http {
             method: LightMethod::Get,
             route: Route::GatewayBot,
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -2996,7 +3079,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3014,7 +3097,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3029,7 +3112,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3057,7 +3140,7 @@ impl Http {
                 channel_id,
             },
             params: Some(params),
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3085,7 +3168,7 @@ impl Http {
                 channel_id,
             },
             params: Some(params),
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3113,7 +3196,7 @@ impl Http {
                 channel_id,
             },
             params: Some(params),
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3128,7 +3211,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3143,7 +3226,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3163,7 +3246,7 @@ impl Http {
                 user_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3183,7 +3266,7 @@ impl Http {
                 user_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3203,6 +3286,7 @@ impl Http {
                 user_id,
             },
             params: Some(vec![("with_member", with_member.to_string())]),
+            context_properties: None,
         })
         .await
     }
@@ -3237,7 +3321,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3252,7 +3336,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3267,7 +3351,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3282,7 +3366,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3321,7 +3405,7 @@ impl Http {
                     answer_id,
                 },
                 params: Some(params),
-            })
+            context_properties: None,            })
             .await?;
 
         Ok(resp.users)
@@ -3342,7 +3426,7 @@ impl Http {
                 message_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3357,7 +3441,7 @@ impl Http {
             method: LightMethod::Get,
             route: Route::Oauth2ApplicationCurrent,
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3370,7 +3454,7 @@ impl Http {
             method: LightMethod::Get,
             route: Route::UserMe,
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3385,7 +3469,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3401,7 +3485,7 @@ impl Http {
                 emoji_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3423,7 +3507,7 @@ impl Http {
                     application_id: self.try_application_id()?,
                 },
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         Ok(result.items)
@@ -3441,7 +3525,7 @@ impl Http {
                 emoji_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3492,7 +3576,7 @@ impl Http {
                 application_id: self.try_application_id()?,
             },
             params: Some(params),
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3505,7 +3589,7 @@ impl Http {
             method: LightMethod::Get,
             route: Route::Gateway,
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3520,7 +3604,7 @@ impl Http {
                 application_id: self.try_application_id()?,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3535,6 +3619,7 @@ impl Http {
                 application_id: self.try_application_id()?,
             },
             params: Some(vec![("with_localizations", true.to_string())]),
+            context_properties: None,
         })
         .await
     }
@@ -3551,7 +3636,7 @@ impl Http {
                 command_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3566,7 +3651,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3581,6 +3666,7 @@ impl Http {
                 guild_id,
             },
             params: Some(vec![("with_counts", true.to_string())]),
+            context_properties: None,
         })
         .await
     }
@@ -3597,7 +3683,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3617,6 +3703,7 @@ impl Http {
                 guild_id,
             },
             params: Some(vec![("with_localizations", true.to_string())]),
+            context_properties: None,
         })
         .await
     }
@@ -3638,7 +3725,7 @@ impl Http {
                 command_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3657,7 +3744,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3678,7 +3765,7 @@ impl Http {
                 command_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3695,7 +3782,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3710,7 +3797,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3725,7 +3812,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3740,7 +3827,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3755,7 +3842,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3775,7 +3862,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
         .map(|x| x.code)
     }
@@ -3810,7 +3897,7 @@ impl Http {
                     guild_id,
                 },
                 params: Some(params),
-            })
+            context_properties: None,            })
             .await?;
 
         if let Some(values) = value.as_array_mut() {
@@ -3835,6 +3922,7 @@ impl Http {
                 guild_id,
             },
             params: Some(vec![("days", days.to_string())]),
+            context_properties: None,
         })
         .await
     }
@@ -3851,7 +3939,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -3868,7 +3956,7 @@ impl Http {
                     role_id,
                 },
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         if let Some(map) = value.as_object_mut() {
@@ -3890,7 +3978,7 @@ impl Http {
                     guild_id,
                 },
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         if let Some(array) = value.as_array_mut() {
@@ -3925,6 +4013,7 @@ impl Http {
                 event_id,
             },
             params: Some(vec![("with_user_count", with_user_count.to_string())]),
+            context_properties: None,
         })
         .await
     }
@@ -3948,6 +4037,7 @@ impl Http {
                 guild_id,
             },
             params: Some(vec![("with_user_count", with_user_count.to_string())]),
+            context_properties: None,
         })
         .await
     }
@@ -4000,7 +4090,7 @@ impl Http {
                 event_id,
             },
             params: Some(params),
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4016,7 +4106,7 @@ impl Http {
                     guild_id,
                 },
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         if let Some(array) = value.as_array_mut() {
@@ -4047,7 +4137,7 @@ impl Http {
                     sticker_id,
                 },
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         if let Some(map) = value.as_object_mut() {
@@ -4087,7 +4177,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4140,7 +4230,7 @@ impl Http {
             method: LightMethod::Get,
             route: Route::UserMeGuilds,
             params: Some(params),
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4184,7 +4274,7 @@ impl Http {
                     guild_id,
                 },
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         if let Some(map) = value.as_object_mut() {
@@ -4211,6 +4301,7 @@ impl Http {
         member_counts: bool,
         expiration: bool,
         event_id: Option<ScheduledEventId>,
+        input_value: Option<&str>,
     ) -> Result<Invite> {
         #[cfg(feature = "utils")]
         let code = crate::utils::parse_invite(code);
@@ -4222,6 +4313,9 @@ impl Http {
         if let Some(event_id) = event_id {
             params.push(("guild_scheduled_event_id", event_id.to_string()));
         }
+        if let Some(input_value) = input_value {
+            params.push(("inputValue", input_value.to_string()));
+        }
 
         self.fire(Request {
             body: None,
@@ -4232,6 +4326,109 @@ impl Http {
                 code,
             },
             params: Some(params),
+            context_properties: None,        })
+        .await
+    }
+
+    /// Accepts/joins an invite by code.
+    ///
+    /// This will join a guild, accept a group DM invite, or accept a friend request depending on
+    /// the invite type.
+    ///
+    /// # Arguments
+    ///
+    /// * `code` - The invite code to accept.
+    /// * `session_id` - Optional session ID (16-char alphanumeric). If None, one will be generated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Http`] if the invite is invalid or the user is banned/can't join.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use serenity::http::Http;
+    /// # async fn run() {
+    /// # let http = Http::new("");
+    /// use serenity::utils;
+    ///
+    /// // Accept an invite
+    /// let invite = http.accept_invite("code", None).await.unwrap();
+    /// println!("Joined: {:?}", invite.guild.map(|g| g.name));
+    /// # }
+    /// ```
+    pub async fn accept_invite(
+        &self,
+        code: &str,
+        session_id: Option<String>,
+    ) -> Result<Invite> {
+        #[cfg(feature = "utils")]
+        let code = crate::utils::parse_invite(code);
+
+        // First fetch the invite to get its details
+        let invite = self.get_invite(code, true, true, None, Some(code)).await?;
+
+        // Generate session ID if not provided
+        #[cfg(feature = "utils")]
+        let session_id = session_id.unwrap_or_else(crate::utils::generate_session_id);
+        #[cfg(not(feature = "utils"))]
+        let session_id = session_id.ok_or_else(|| {
+            Error::Other("session_id required when utils feature is disabled")
+        })?;
+
+        // Determine appropriate context properties based on invite type
+        use crate::http::context_properties::ContextProperties;
+        use crate::model::invite::InviteType;
+
+        let context = match invite.invite_type {
+            InviteType::Guild | InviteType::GroupDm => {
+                // Randomly choose between AcceptInvitePage and JoinGuild (mimics Python impl)
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static TOGGLE: AtomicBool = AtomicBool::new(false);
+
+                let guild_id = invite.guild.as_ref().map(|g| g.id);
+                let channel_id = Some(invite.channel.id);
+                let channel_type = Some(invite.channel.kind);
+
+                if TOGGLE.fetch_xor(true, Ordering::Relaxed) {
+                    ContextProperties::JoinGuild {
+                        guild_id,
+                        channel_id,
+                        channel_type,
+                    }
+                } else {
+                    ContextProperties::AcceptInvitePage {
+                        guild_id,
+                        channel_id,
+                        channel_type,
+                    }
+                }
+            },
+            _ => {
+                // Friend invites or unknown types use AcceptInvitePage
+                ContextProperties::AcceptInvitePage {
+                    guild_id: invite.guild.as_ref().map(|g| g.id),
+                    channel_id: Some(invite.channel.id),
+                    channel_type: Some(invite.channel.kind),
+                }
+            },
+        };
+
+        // Build the request payload
+        let body = json!({
+            "session_id": session_id,
+        });
+
+        self.fire(Request {
+            body: Some(to_vec(&body)?),
+            multipart: None,
+            headers: None,
+            method: LightMethod::Post,
+            route: Route::Invite {
+                code,
+            },
+            params: None,
+            context_properties: Some(context),
         })
         .await
     }
@@ -4249,7 +4446,7 @@ impl Http {
                     user_id,
                 },
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         if let Some(map) = value.as_object_mut() {
@@ -4275,7 +4472,7 @@ impl Http {
                 message_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4307,7 +4504,7 @@ impl Http {
                 channel_id,
             },
             params: Some(params),
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4322,7 +4519,7 @@ impl Http {
                 sticker_pack_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4340,7 +4537,7 @@ impl Http {
             method: LightMethod::Get,
             route: Route::StickerPacks,
             params: None,
-        })
+            context_properties: None,        })
         .await
         .map(|s| s.sticker_packs)
     }
@@ -4356,7 +4553,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4384,7 +4581,7 @@ impl Http {
                 reaction: &reaction_type.as_data(),
             },
             params: Some(params),
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4399,7 +4596,7 @@ impl Http {
                 application_id: self.try_application_id()?,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4414,7 +4611,7 @@ impl Http {
                 sticker_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4436,7 +4633,7 @@ impl Http {
                 method: LightMethod::Get,
                 route: Route::StatusIncidentsUnresolved,
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         Ok(status.incidents)
@@ -4460,7 +4657,7 @@ impl Http {
                 method: LightMethod::Get,
                 route: Route::StatusMaintenancesUpcoming,
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         Ok(status.scheduled_maintenances)
@@ -4477,7 +4674,7 @@ impl Http {
                 user_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4494,7 +4691,7 @@ impl Http {
             method: LightMethod::Get,
             route: Route::UserMeConnections,
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4507,7 +4704,7 @@ impl Http {
             method: LightMethod::Get,
             route: Route::UserMeDmChannels,
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4520,7 +4717,7 @@ impl Http {
             method: LightMethod::Get,
             route: Route::VoiceRegions,
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4541,7 +4738,7 @@ impl Http {
                 user_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4575,7 +4772,7 @@ impl Http {
                 webhook_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4615,7 +4812,7 @@ impl Http {
                 token,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4652,7 +4849,7 @@ impl Http {
                 token,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4673,7 +4870,7 @@ impl Http {
                 user_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4688,7 +4885,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4712,7 +4909,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        };
+            context_properties: None,        };
 
         if files.is_empty() {
             request.body = Some(to_vec(map)?);
@@ -4744,7 +4941,7 @@ impl Http {
                 message_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4765,7 +4962,7 @@ impl Http {
                 user_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4792,7 +4989,7 @@ impl Http {
                 role_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4817,6 +5014,7 @@ impl Http {
                     ("query", query.to_string()),
                     ("limit", limit.unwrap_or(constants::MEMBER_FETCH_LIMIT).to_string()),
                 ]),
+                context_properties: None,
             })
             .await?;
 
@@ -4847,6 +5045,7 @@ impl Http {
                 guild_id,
             },
             params: Some(vec![("days", days.to_string())]),
+            context_properties: None,
         })
         .await
     }
@@ -4867,7 +5066,7 @@ impl Http {
                 integration_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4890,7 +5089,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4951,7 +5150,7 @@ impl Http {
                 message_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4970,7 +5169,7 @@ impl Http {
                 channel_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -4983,7 +5182,7 @@ impl Http {
             method: LightMethod::Get,
             route: Route::SoundboardDefaultSounds,
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -5004,7 +5203,7 @@ impl Http {
                     guild_id,
                 },
                 params: None,
-            })
+            context_properties: None,            })
             .await?;
 
         Ok(result.items)
@@ -5026,7 +5225,7 @@ impl Http {
                 sound_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -5046,7 +5245,7 @@ impl Http {
                 guild_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -5068,7 +5267,7 @@ impl Http {
                 sound_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -5089,7 +5288,7 @@ impl Http {
                 sound_id,
             },
             params: None,
-        })
+            context_properties: None,        })
         .await
     }
 
@@ -5167,22 +5366,116 @@ impl Http {
     /// # }
     /// ```
     #[instrument]
-    pub async fn request(&self, req: Request<'_>) -> Result<ReqwestResponse> {
+    pub async fn request(&self, mut req: Request<'_>) -> Result<ReqwestResponse> {
         let method = req.method.reqwest_method();
-        let response = if let Some(ratelimiter) = &self.ratelimiter {
-            ratelimiter.perform(req).await?
-        } else {
-            let request = req.build(&self.client, self.token(), self.proxy.as_deref())?.build()?;
-            self.client.execute(request).await?
-        };
+        let route_path = req.route.path().to_string();
 
-        if response.status().is_success() {
-            Ok(response)
-        } else {
-            Err(Error::Http(HttpError::UnsuccessfulRequest(
-                ErrorResponse::from_response(response, method).await,
-            )))
+        // Retry loop for CAPTCHA handling (up to 4 attempts)
+        for attempt in 1..=4 {
+            let super_props_encoded = self.super_properties.encode();
+            let user_agent = self.super_properties.user_agent();
+
+            let response = if let Some(ratelimiter) = &self.ratelimiter {
+                ratelimiter.perform(req.clone(), &super_props_encoded, user_agent).await?
+            } else {
+                let request = req.clone().build(
+                    &self.client,
+                    self.token(),
+                    self.proxy.as_deref(),
+                    &super_props_encoded,
+                    user_agent,
+                )?.build()?;
+                self.client.execute(request).await?
+            };
+
+            if response.status().is_success() {
+                return Ok(response);
+            }
+
+            // Check if this is a CAPTCHA challenge
+            let status_code = response.status();
+            let response_text = response.text().await?;
+
+            // Try to parse as JSON to check for CAPTCHA
+            if let Ok(json_value) = serde_json::from_str::<Value>(&response_text) {
+                // Check if response contains captcha_key field
+                if json_value.get("captcha_key").is_some() {
+                    // Try to deserialize as CaptchaRequiredData
+                    if let Ok(captcha_data) = serde_json::from_value::<super::CaptchaRequiredData>(json_value.clone()) {
+                        // If we have a handler and not on last attempt, try to solve
+                        if let Some(ref handler) = self.captcha_handler {
+                            if attempt < 4 {
+                                // Call the CAPTCHA handler to get solution
+                                let solution = handler(captcha_data.clone()).await?;
+
+                                // Add CAPTCHA headers to the request
+                                let mut headers = req.headers.take().unwrap_or_default();
+                                headers.insert(
+                                    "X-Captcha-Key",
+                                    HeaderValue::from_str(&solution).map_err(HttpError::InvalidHeader)?,
+                                );
+
+                                if let Some(ref session_id) = captcha_data.captcha_session_id {
+                                    headers.insert(
+                                        "X-Captcha-Session-Id",
+                                        HeaderValue::from_str(session_id).map_err(HttpError::InvalidHeader)?,
+                                    );
+                                }
+
+                                if let Some(ref rqtoken) = captcha_data.captcha_rqtoken {
+                                    headers.insert(
+                                        "X-Captcha-Rqtoken",
+                                        HeaderValue::from_str(rqtoken).map_err(HttpError::InvalidHeader)?,
+                                    );
+                                }
+
+                                req.headers = Some(headers);
+
+                                // Continue to next iteration to retry
+                                continue;
+                            }
+                        }
+
+                        // No handler or last attempt, return CAPTCHA error
+                        return Err(Error::Http(HttpError::CaptchaRequired(captcha_data)));
+                    }
+                }
+
+                // Not a CAPTCHA error, parse as regular error
+                if let Ok(discord_error) = serde_json::from_value::<super::DiscordJsonError>(json_value) {
+                    return Err(Error::Http(HttpError::UnsuccessfulRequest(super::ErrorResponse {
+                        status_code,
+                        url: route_path.clone(),
+                        method,
+                        error: discord_error,
+                    })));
+                }
+            }
+
+            // Couldn't parse response, return generic error
+            return Err(Error::Http(HttpError::UnsuccessfulRequest(super::ErrorResponse {
+                status_code,
+                url: route_path.clone(),
+                method,
+                error: super::DiscordJsonError {
+                    code: -1,
+                    message: format!("[Serenity] Could not decode error response: {}", response_text),
+                    errors: vec![],
+                },
+            })));
         }
+
+        // This should never be reached, but just in case
+        Err(Error::Http(HttpError::UnsuccessfulRequest(super::ErrorResponse {
+            status_code: StatusCode::INTERNAL_SERVER_ERROR,
+            url: route_path,
+            method,
+            error: super::DiscordJsonError {
+                code: -1,
+                message: "[Serenity] Maximum CAPTCHA retry attempts exceeded".to_string(),
+                errors: vec![],
+            },
+        })))
     }
 
     /// Performs a request and then verifies that the response status code is equal to the expected

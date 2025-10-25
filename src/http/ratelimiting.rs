@@ -178,8 +178,13 @@ impl Ratelimiter {
     /// # Errors
     ///
     /// Only error kind that may be returned is [`Error::Http`].
-    #[instrument]
-    pub async fn perform(&self, req: Request<'_>) -> Result<Response> {
+    #[instrument(skip(super_properties_encoded, user_agent))]
+    pub async fn perform(
+        &self,
+        req: Request<'_>,
+        super_properties_encoded: &str,
+        user_agent: &str,
+    ) -> Result<Response> {
         loop {
             // This will block if another thread hit the global ratelimit.
             drop(self.global.lock().await);
@@ -196,7 +201,13 @@ impl Ratelimiter {
 
             bucket.lock().await.pre_hook(&req, &self.ratelimit_callback).await;
 
-            let request = req.clone().build(&self.client, self.token.expose_secret(), None)?;
+            let request = req.clone().build(
+                &self.client,
+                self.token.expose_secret(),
+                None,
+                super_properties_encoded,
+                user_agent,
+            )?;
             let response = self.client.execute(request.build()?).await?;
 
             // Check if the request got ratelimited by checking for status 429, and if so, sleep

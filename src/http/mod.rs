@@ -20,30 +20,59 @@
 //! [model]: crate::model
 
 mod client;
+mod context_properties;
 mod error;
 mod multipart;
 mod ratelimiting;
 mod request;
 mod routing;
+mod super_properties;
 mod typing;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use reqwest::Method;
 pub use reqwest::StatusCode;
 
 pub use self::client::*;
+pub use self::context_properties::*;
 pub use self::error::*;
 pub use self::multipart::*;
 pub use self::ratelimiting::*;
 pub use self::request::*;
 pub use self::routing::*;
+pub use self::super_properties::*;
 pub use self::typing::*;
 #[cfg(feature = "cache")]
 use crate::cache::Cache;
 #[cfg(feature = "client")]
 use crate::client::Context;
 use crate::model::prelude::*;
+
+/// Type alias for a CAPTCHA solving handler.
+///
+/// The handler receives [`CaptchaRequiredData`] containing information about the challenge,
+/// and must return a `Future` that resolves to the CAPTCHA solution token as a `String`.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use serenity::http::{CaptchaHandler, CaptchaRequiredData};
+/// use serenity::Error;
+/// use std::sync::Arc;
+///
+/// fn my_captcha_solver(data: CaptchaRequiredData) -> Result<String, Error> {
+///     // Your CAPTCHA solving logic here
+///     // Use data.sitekey() and data.service() to determine how to solve
+///     Ok("captcha_solution_token".to_string())
+/// }
+///
+/// let handler: CaptchaHandler = Arc::new(my_captcha_solver);
+/// ```
+pub type CaptchaHandler =
+    Arc<dyn Fn(CaptchaRequiredData) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> + Send + Sync>;
 
 /// This trait will be required by functions that need [`Http`] and can optionally use a [`Cache`]
 /// to potentially avoid REST-requests.
