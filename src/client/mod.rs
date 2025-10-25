@@ -322,6 +322,16 @@ impl ClientBuilder {
     pub fn get_presence(&self) -> &PresenceData {
         &self.presence
     }
+
+    /// Sets the CAPTCHA handler to be used when Discord requests CAPTCHA verification.
+    ///
+    /// The handler receives [`CaptchaRequiredData`] and must return a solved CAPTCHA token.
+    ///
+    /// [`CaptchaRequiredData`]: crate::http::CaptchaRequiredData
+    pub fn captcha_handler(mut self, handler: crate::http::CaptchaHandler) -> Self {
+        self.http.captcha_handler = Some(handler);
+        self
+    }
 }
 
 #[cfg(feature = "gateway")]

@@ -9,6 +9,76 @@ use url::ParseError as UrlError;
 use crate::internal::prelude::*;
 use crate::json::*;
 
+/// The CAPTCHA service Discord can use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CaptchaService {
+    /// reCAPTCHA
+    Recaptcha,
+    /// hCAPTCHA
+    Hcaptcha,
+    /// Enterprise reCAPTCHA
+    RecaptchaEnterprise,
+}
+
+impl CaptchaService {
+    /// Get the default sitekey for this service
+    #[must_use]
+    pub const fn default_sitekey(&self) -> &'static str {
+        match self {
+            Self::Recaptcha => "6Lef5iQTAAAAAKeIvIY-DeexoO3gj7ryl9rLMEnn",
+            Self::RecaptchaEnterprise => "6LeYqFcqAAAAAD6iZesmNgVulsO4PkpBdr6NVG6M",
+            Self::Hcaptcha => "f5561ba9-8f1e-40ca-9b5b-a0b3f719ef34",
+        }
+    }
+}
+
+/// Information about a CAPTCHA challenge from Discord.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct CaptchaRequiredData {
+    /// The CAPTCHA service errors.
+    #[serde(default)]
+    pub captcha_key: Vec<String>,
+    /// The CAPTCHA service to use.
+    #[serde(default)]
+    pub captcha_service: Option<CaptchaService>,
+    /// Custom sitekey if Discord provides one
+    pub captcha_sitekey: Option<String>,
+    /// The CAPTCHA session ID.
+    pub captcha_session_id: Option<String>,
+    /// The enterprise hCaptcha request data.
+    pub captcha_rqdata: Option<String>,
+    /// The enterprise hCAPTCHA request token.
+    pub captcha_rqtoken: Option<String>,
+    /// Whether the CAPTCHA should be invisible.
+    #[serde(default)]
+    pub should_serve_invisible: bool,
+}
+
+impl CaptchaRequiredData {
+    /// Get the sitekey to use for solving this CAPTCHA.
+    ///
+    /// Returns the custom sitekey if provided, otherwise returns the default for the service.
+    #[must_use]
+    pub fn sitekey(&self) -> &str {
+        if let Some(ref sitekey) = self.captcha_sitekey {
+            sitekey
+        } else {
+            self.captcha_service
+                .unwrap_or(CaptchaService::Recaptcha)
+                .default_sitekey()
+        }
+    }
+
+    /// Get the CAPTCHA service being used.
+    #[must_use]
+    pub fn service(&self) -> CaptchaService {
+        self.captcha_service.unwrap_or(CaptchaService::Recaptcha)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct DiscordJsonError {
@@ -61,6 +131,8 @@ impl ErrorResponse {
 pub enum HttpError {
     /// When a non-successful status code was received for a request.
     UnsuccessfulRequest(ErrorResponse),
+    /// When a CAPTCHA challenge is required.
+    CaptchaRequired(CaptchaRequiredData),
     /// When the decoding of a ratelimit header could not be properly decoded into an `i64` or
     /// `f64`.
     RateLimitI64F64,
@@ -158,6 +230,13 @@ impl fmt::Display for HttpError {
                 }
 
                 Ok(())
+            },
+            Self::CaptchaRequired(data) => {
+                write!(f, "CAPTCHA required ({:?} service", data.service())?;
+                if let Some(ref session_id) = data.captcha_session_id {
+                    write!(f, ", session: {}", session_id)?;
+                }
+                f.write_str(")")
             },
             Self::RateLimitI64F64 => f.write_str("Error decoding a header into an i64 or f64"),
             Self::RateLimitUtf8 => f.write_str("Error decoding a header from UTF-8"),

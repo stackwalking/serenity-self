@@ -369,8 +369,8 @@ pub struct Ready {
     pub resume_gateway_url: String,
     /// Shard information associated with this session, if sent when identifying
     pub shard: Option<ShardInfo>,
-    /// Contains id and flags
-    pub application: PartialCurrentApplicationInfo,
+    /// Contains id and flags (only present for bot accounts)
+    pub application: Option<PartialCurrentApplicationInfo>,
 }
 
 /// Information describing how many gateway sessions you can initiate within a ratelimit period.

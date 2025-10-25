@@ -59,6 +59,17 @@ pub struct Invite {
     /// guild scheduled event id (according to Discord docs, whatever that means).
     #[serde(rename = "guild_scheduled_event")]
     pub scheduled_event: Option<ScheduledEvent>,
+    /// The type of invite (guild, group DM, or friend).
+    #[serde(rename = "type", default)]
+    pub invite_type: InviteType,
+    /// Whether the user is a new member after accepting this invite.
+    /// Only present when the invite is accepted.
+    #[serde(default)]
+    pub new_member: bool,
+    /// Whether to show the verification form after accepting.
+    /// Only present when the invite is accepted.
+    #[serde(default)]
+    pub show_verification_form: bool,
 }
 
 #[cfg(feature = "model")]
@@ -141,7 +152,7 @@ impl Invite {
             invite = crate::utils::parse_invite(invite);
         }
 
-        http.as_ref().get_invite(invite, member_counts, expiration, event_id).await
+        http.as_ref().get_invite(invite, member_counts, expiration, event_id, None).await
     }
 
     /// Returns a URL to use for the invite.
@@ -189,6 +200,41 @@ impl Invite {
     #[must_use]
     pub fn url(&self) -> String {
         format!("https://discord.gg/{}", self.code)
+    }
+
+    /// Accepts/uses the invite.
+    ///
+    /// This will join the guild, group DM, or accept the friend request depending on the invite
+    /// type.
+    ///
+    /// **Note**: This is a user-only endpoint. Bots cannot use invites.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Http`] if the invite is invalid, the user is banned, or the user cannot
+    /// join for any other reason.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use serenity::model::prelude::*;
+    /// # use serenity::prelude::*;
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let http: Http = unimplemented!();
+    /// let invite = Invite::get(&http, "code", true, true, None).await?;
+    /// let accepted = invite.accept(&http).await?;
+    /// println!("Joined guild: {:?}", accepted.guild.map(|g| g.name));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn accept(&self, http: impl AsRef<Http>) -> Result<Invite> {
+        http.as_ref().accept_invite(&self.code, None).await
+    }
+
+    /// Alias for [`Self::accept`].
+    #[inline]
+    pub async fn use_invite(&self, http: impl AsRef<Http>) -> Result<Invite> {
+        self.accept(http).await
     }
 }
 
@@ -413,6 +459,23 @@ enum_number! {
     pub enum InviteTargetType {
         Stream = 1,
         EmbeddedApplication = 2,
+        _ => Unknown(u8),
+    }
+}
+
+enum_number! {
+    /// Type of invite.
+    ///
+    /// [Discord docs](https://discord.com/developers/docs/resources/invite#invite-object-invite-types).
+    #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+    #[cfg_attr(feature = "typesize", derive(typesize::derive::TypeSize))]
+    #[serde(from = "u8", into = "u8")]
+    #[non_exhaustive]
+    pub enum InviteType {
+        #[default]
+        Guild = 0,
+        GroupDm = 1,
+        Friend = 2,
         _ => Unknown(u8),
     }
 }

@@ -75,6 +75,48 @@ pub fn parse_invite(code: &str) -> &str {
     }
 }
 
+/// Generates a random 16-character alphanumeric session ID.
+///
+/// This is used when accepting invites to mimic the Discord client's behavior.
+///
+/// # Examples
+///
+/// ```rust
+/// use serenity::utils;
+///
+/// let session_id = utils::generate_session_id();
+/// assert_eq!(session_id.len(), 16);
+/// assert!(session_id.chars().all(|c| c.is_ascii_alphanumeric()));
+/// ```
+#[must_use]
+pub fn generate_session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+    // Get nanoseconds since UNIX_EPOCH for randomness
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    // Combine with counter for uniqueness
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let seed = nanos.wrapping_add(counter);
+
+    // Simple pseudo-random number generator
+    let mut state = seed;
+    (0..16)
+        .map(|_| {
+            // Simple LCG (Linear Congruential Generator)
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            CHARSET[(state as usize) % CHARSET.len()] as char
+        })
+        .collect()
+}
+
 /// Retrieves the username and discriminator out of a user tag (`name#discrim`).
 /// In order to accomodate next gen Discord usernames, this will also accept `name` style tags.
 ///

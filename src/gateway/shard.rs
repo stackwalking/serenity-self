@@ -290,7 +290,9 @@ impl Shard {
                 self.stage = ConnectionStage::Connected;
 
                 if let Some(callback) = self.application_id_callback.take() {
-                    callback(ready.ready.application.id);
+                    if let Some(application) = &ready.ready.application {
+                        callback(application.id);
+                    }
                 }
             },
             Event::Resumed(_) => {
