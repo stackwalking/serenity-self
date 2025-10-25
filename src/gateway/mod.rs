@@ -53,7 +53,7 @@ use reqwest::Url;
 pub use self::bridge::*;
 pub use self::error::Error as GatewayError;
 pub use self::shard::Shard;
-pub use self::ws::WsClient;
+pub use self::ws::{GuildSubscribeOptions, WsClient};
 #[cfg(feature = "http")]
 use crate::internal::prelude::*;
 use crate::model::gateway::{Activity, ActivityType};

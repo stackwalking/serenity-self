@@ -652,6 +652,140 @@ impl Shard {
         self.client.send_chunk_guild(guild_id, &self.info, limit, presences, filter, nonce).await
     }
 
+    /// Subscribes to multiple guilds to receive events (user accounts only).
+    ///
+    /// This sends a bulk guild subscribe message (OP 37) to the gateway.
+    /// User accounts must subscribe to guilds to receive events like messages,
+    /// typing indicators, member updates, etc.
+    ///
+    /// # Notes
+    ///
+    /// - The client is automatically subscribed to all guilds with < 75k members on connect
+    /// - For guilds not subscribed to, you won't receive non-stateful events
+    ///   (MESSAGE_CREATE, MESSAGE_UPDATE, MESSAGE_DELETE, etc.)
+    /// - Once subscribed to the `typing` feature, you're considered subscribed to that guild
+    /// - Maximum payload size is 15 KiB
+    ///
+    /// # Examples
+    ///
+    /// Subscribe to a guild with typing and member updates:
+    ///
+    /// ```rust,no_run
+    /// # use std::collections::HashMap;
+    /// # use serenity::gateway::{Shard, GuildSubscribeOptions};
+    /// # use serenity::model::id::GuildId;
+    /// # async fn example(shard: &mut Shard) -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut subscriptions = HashMap::new();
+    /// subscriptions.insert(
+    ///     "1234567890".to_string(),
+    ///     GuildSubscribeOptions {
+    ///         typing: Some(true),
+    ///         threads: Some(true),
+    ///         activities: Some(true),
+    ///         member_updates: Some(true),
+    ///         ..Default::default()
+    ///     },
+    /// );
+    /// shard.bulk_guild_subscribe(&subscriptions).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem with the websocket connection.
+    pub async fn bulk_guild_subscribe(
+        &mut self,
+        subscriptions: &std::collections::HashMap<String, super::GuildSubscribeOptions>,
+    ) -> Result<()> {
+        debug!("[{:?}] Sending bulk guild subscribe", self.info);
+
+        self.client.send_bulk_guild_subscribe(&self.info, subscriptions).await
+    }
+
+    /// Automatically subscribes to guilds based on criteria (user accounts only).
+    ///
+    /// This method subscribes to:
+    /// - All unavailable guilds
+    /// - All guilds with more than 75,000 members
+    ///
+    /// For other guilds (available and < 75k members), Discord automatically subscribes them.
+    ///
+    /// # Parameters
+    ///
+    /// - `guilds`: List of tuples containing (guild_id, member_count, unavailable)
+    ///
+    /// # Examples
+    ///
+    /// Call this from your ready event handler:
+    ///
+    /// ```rust,no_run
+    /// # use serenity::{async_trait, client::{Context, EventHandler}, model::gateway::Ready};
+    /// struct Handler;
+    ///
+    /// #[async_trait]
+    /// impl EventHandler for Handler {
+    ///     async fn ready(&self, ctx: Context, ready: Ready) {
+    ///         // Collect guild info from the ready event
+    ///         let guild_info: Vec<_> = ready.guilds.iter()
+    ///             .map(|g| (g.id, None, g.unavailable)) // member_count is None in ready
+    ///             .collect();
+    ///
+    ///         // Auto-subscribe to unavailable guilds and large guilds
+    ///         if let Some(shard) = ctx.shard.upgrade() {
+    ///             let runners = shard.runners.lock().await;
+    ///             if let Some(runner) = runners.get(&ctx.shard_id) {
+    ///                 // Note: This example is simplified. In practice, you'd need to
+    ///                 // access the shard's mutable state, which requires different architecture.
+    ///                 // See examples for the recommended pattern.
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem with the websocket connection.
+    pub async fn auto_subscribe_guilds(
+        &mut self,
+        guilds: &[(GuildId, Option<u64>, bool)], // (guild_id, member_count, unavailable)
+    ) -> Result<()> {
+        use std::collections::HashMap;
+
+        let mut subscriptions = HashMap::new();
+
+        for &(guild_id, member_count, unavailable) in guilds {
+            // Subscribe if:
+            // 1. Guild is unavailable, OR
+            // 2. Guild has more than 75,000 members
+            let should_subscribe = unavailable || member_count.map_or(false, |count| count > 75_000);
+
+            if should_subscribe {
+                let opts = super::GuildSubscribeOptions {
+                    typing: Some(true),
+                    threads: Some(true),
+                    activities: Some(true),
+                    member_updates: Some(true),
+                    ..Default::default()
+                };
+
+                subscriptions.insert(guild_id.to_string(), opts);
+            }
+        }
+
+        if !subscriptions.is_empty() {
+            debug!(
+                "[{:?}] Auto-subscribing to {} guilds",
+                self.info,
+                subscriptions.len()
+            );
+            self.bulk_guild_subscribe(&subscriptions).await?;
+        }
+
+        Ok(())
+    }
+
     /// Sets the shard as going into identifying stage, which sets:
     /// - the time that the last heartbeat sent as being now
     /// - the `stage` to [`ConnectionStage::Identifying`]

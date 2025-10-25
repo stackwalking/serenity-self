@@ -320,6 +320,26 @@ impl ShardRunner {
                 self.shard.set_status(status);
                 self.shard.update_presence().await.is_ok()
             },
+            #[cfg(feature = "cache")]
+            ShardRunnerMessage::FlushGuildSubscriptions => {
+                use tracing::info;
+                let shard_info = self.shard.shard_info();
+                info!("Flushing guild subscriptions to Discord");
+                match self.cache
+                    .guild_subscriptions
+                    .flush(&mut self.shard.client, &shard_info)
+                    .await
+                {
+                    Ok(_) => {
+                        info!("Successfully flushed guild subscriptions");
+                        true
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to flush guild subscriptions: {}", e);
+                        false
+                    }
+                }
+            },
         }
     }
 

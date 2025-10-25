@@ -36,16 +36,11 @@ impl EventHandler for Handler {
         if msg.guild_id.is_none() {
             println!("{}: {}", msg.author.name, msg.content);
         } else {
-            println!("[{:?}] {}: {}", msg.guild(&ctx.cache).map(|g| g.name.to_string()), msg.author.name, msg.content);
+            println!("[{:?}] {}: {}", msg.guild(&ctx.cache).map(|g| g.name.to_string()).unwrap_or_default(), msg.author.name, msg.content);
         }
-
     }
     async fn ready(&self, ctx: Context, ready: Ready) {
-        let uid_b64 = base64::engine::general_purpose::STANDARD.encode(ready.user.id.get().to_le_bytes());
-        tracing::info!("{} is connected!", uid_b64);
-
-        // let invite = ctx.http.accept_invite("6cnC8W9a", None).await.unwrap();
-        // tracing::info!("Joined: {:?}", &invite.guild.map(|g| g.name));
+        tracing::info!("{} is connected!", base64::engine::general_purpose::STANDARD.encode(ready.user.id.get().to_le_bytes()));
     }
 }
 
@@ -75,7 +70,8 @@ async fn main() {
         .init();
 
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
-    let intents = GatewayIntents::GUILD_MESSAGES
+    let intents = GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
 

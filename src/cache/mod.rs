@@ -45,8 +45,11 @@ use crate::model::prelude::*;
 
 mod cache_update;
 mod event;
+mod guild_subscriptions;
 mod settings;
 pub(crate) mod wrappers;
+
+pub use self::guild_subscriptions::GuildSubscriptions;
 
 #[cfg(feature = "temp_cache")]
 pub(crate) use wrappers::MaybeOwnedArc;
@@ -130,6 +133,7 @@ pub(crate) struct CachedShardData {
     pub total: u32,
     pub connected: HashSet<ShardId>,
     pub has_sent_shards_ready: bool,
+    pub has_sent_cache_ready: bool,
 }
 
 /// A cache containing data received from [`Shard`]s.
@@ -230,6 +234,10 @@ pub struct Cache {
     ///
     /// Refer to the documentation for [`CurrentUser`] for more information.
     pub(crate) user: RwLock<CurrentUser>,
+    /// Guild subscription manager for user accounts.
+    ///
+    /// Handles automatic subscription to guilds to receive message content and events.
+    pub guild_subscriptions: GuildSubscriptions,
     /// The settings for the cache.
     settings: RwLock<Settings>,
 }
@@ -289,8 +297,10 @@ impl Cache {
                 total: 1,
                 connected: HashSet::new(),
                 has_sent_shards_ready: false,
+                has_sent_cache_ready: false,
             }),
             user: RwLock::new(CurrentUser::default()),
+            guild_subscriptions: GuildSubscriptions::new(),
             settings: RwLock::new(settings),
         }
     }

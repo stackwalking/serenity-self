@@ -229,6 +229,10 @@ pub struct Guild {
     /// Whether this guild is unavailable due to an outage.
     #[serde(default)]
     pub unavailable: bool,
+    /// Whether the guild has threads subscription enabled (user accounts only).
+    /// When present and true, indicates Discord has automatically subscribed to this guild's threads.
+    #[serde(default)]
+    pub has_threads_subscription: bool,
     /// The number of members in the guild.
     pub member_count: u64,
     /// A mapping of [`User`]s to their current voice state.

@@ -23,6 +23,8 @@ use tracing::warn;
 use tracing::{debug, instrument, trace};
 use url::Url;
 
+use std::collections::HashMap;
+
 use super::{ActivityData, ChunkGuildFilter, PresenceData};
 use crate::constants::{self, Opcode};
 #[cfg(feature = "client")]
@@ -33,7 +35,7 @@ use crate::json::to_string;
 #[cfg(feature = "client")]
 use crate::model::event::GatewayEvent;
 use crate::model::gateway::{GatewayIntents, ShardInfo};
-use crate::model::id::{GuildId, UserId};
+use crate::model::id::{ChannelId, GuildId, UserId};
 #[cfg(feature = "client")]
 use crate::Error;
 use crate::Result;
@@ -65,6 +67,46 @@ struct PresenceUpdateMessage<'a> {
     activities: &'a [&'a ActivityData],
 }
 
+/// Guild subscription options for user accounts.
+///
+/// User accounts can subscribe to guilds to receive events like messages, typing indicators, etc.
+/// This is required for guilds with more than 75k members, and optional for smaller guilds.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GuildSubscribeOptions {
+    /// Whether to receive TYPING_START events for this guild.
+    /// Once subscribed to typing, the client is considered subscribed to the guild.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub typing: Option<bool>,
+
+    /// Whether to receive thread events for threads the user is not in.
+    /// Triggers a THREAD_LIST_SYNC event with all threads in the guild.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads: Option<bool>,
+
+    /// Whether to receive activity events (purpose not fully documented).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activities: Option<bool>,
+
+    /// Whether to receive member events (GUILD_MEMBER_ADD, GUILD_MEMBER_UPDATE, GUILD_MEMBER_REMOVE).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_updates: Option<bool>,
+
+    /// List of user IDs to subscribe to for GUILD_MEMBER_UPDATE and PRESENCE_UPDATE events.
+    /// No cap except max payload size (15 KiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub members: Option<Vec<UserId>>,
+
+    /// Channel ID to member list ranges mapping for lazy loading members.
+    /// Format: channel_id -> list of [start, end] ranges
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<HashMap<ChannelId, Vec<Vec<u32>>>>,
+
+    /// List of thread IDs to subscribe to for thread member lists.
+    /// Triggers THREAD_MEMBER_LIST_UPDATE events with all members in the thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_member_lists: Option<Vec<ChannelId>>,
+}
+
 #[derive(Serialize)]
 #[serde(untagged)]
 enum WebSocketMessageData<'a> {
@@ -84,6 +126,9 @@ enum WebSocketMessageData<'a> {
         session_id: &'a str,
         token: &'a str,
         seq: u64,
+    },
+    BulkGuildSubscribe {
+        subscriptions: &'a HashMap<String, GuildSubscribeOptions>,
     },
 }
 
@@ -314,6 +359,40 @@ impl WsClient {
                 session_id,
                 token,
                 seq,
+            },
+        })
+        .await
+    }
+
+    /// Sends a bulk guild subscribe message (OP 37).
+    ///
+    /// This is used by user accounts to subscribe to guilds to receive events.
+    /// Guilds with < 75k members are automatically subscribed on connect.
+    /// For larger guilds or to customize subscriptions, use this method.
+    ///
+    /// # Notes
+    ///
+    /// - The client is automatically subscribed to all guilds with < 75k members on connect
+    /// - For guilds not subscribed to, the client won't receive non-stateful events
+    ///   (MESSAGE_CREATE, MESSAGE_UPDATE, MESSAGE_DELETE, etc.)
+    /// - Once subscribed to the `typing` feature, the client is considered subscribed to that guild
+    /// - Maximum payload size is 15 KiB
+    ///
+    /// # Errors
+    ///
+    /// Errors if there is a problem with the WS connection.
+    #[instrument(skip(self, subscriptions))]
+    pub async fn send_bulk_guild_subscribe(
+        &mut self,
+        shard_info: &ShardInfo,
+        subscriptions: &HashMap<String, GuildSubscribeOptions>,
+    ) -> Result<()> {
+        debug!("[{:?}] Sending bulk guild subscribe for {} guilds", shard_info, subscriptions.len());
+
+        self.send_json(&WebSocketMessage {
+            op: Opcode::BulkGuildSubscribe,
+            d: WebSocketMessageData::BulkGuildSubscribe {
+                subscriptions,
             },
         })
         .await

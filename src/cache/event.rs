@@ -98,6 +98,11 @@ impl CacheUpdate for GuildCreateEvent {
         cache.unavailable_guilds.remove(&self.guild.id);
         let mut guild = self.guild.clone();
 
+        // If guild has threads_subscription flag, mark as initially subscribed
+        if self.guild.has_threads_subscription {
+            cache.guild_subscriptions.initial_subscription(self.guild.id);
+        }
+
         for (user_id, member) in &mut guild.members {
             cache.update_user_entry(&member.user);
             if let Some(u) = cache.user(user_id) {
@@ -483,9 +488,15 @@ impl CacheUpdate for ReadyEvent {
     fn update(&mut self, cache: &Cache) -> Option<()> {
         let ready = self.ready.clone();
 
-        for unavailable in ready.guilds {
-            cache.guilds.remove(&unavailable.id);
-            cache.unavailable_guilds.insert(unavailable.id, ());
+        // Clear guild subscription state on Ready
+        cache.guild_subscriptions.clear();
+
+        for guild in ready.guilds {
+            cache.guilds.remove(&guild.id);
+            // Only insert if actually unavailable
+            if guild.unavailable {
+                cache.unavailable_guilds.insert(guild.id, ());
+            }
         }
 
         let shard_data = self.ready.shard.unwrap_or_else(|| ShardInfo::new(ShardId(1), 1));

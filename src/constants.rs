@@ -62,6 +62,12 @@ enum_number! {
         Hello = 10,
         /// Sent immediately following a client heartbeat that was received.
         HeartbeatAck = 11,
+        // GUILD_SYNC          = 12,
+        CallConnect          = 13,
+        //GUILD_SUBSCRIBE       = 14  // Deprecated
+        // REQUEST_COMMANDS    = 24,
+        SearchRecentMembers = 35,
+        BulkGuildSubscribe  = 37,
         _ => Unknown(u8),
     }
 }

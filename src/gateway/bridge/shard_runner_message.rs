@@ -50,4 +50,7 @@ pub enum ShardRunnerMessage {
     SetPresence(Option<ActivityData>, OnlineStatus),
     /// Indicates that the client is to update the shard's presence's status.
     SetStatus(OnlineStatus),
+    /// Indicates that pending guild subscriptions should be flushed (user accounts only).
+    #[cfg(feature = "cache")]
+    FlushGuildSubscriptions,
 }

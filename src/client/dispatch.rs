@@ -61,6 +61,14 @@ pub(crate) fn dispatch_model(
     );
 
     if let Some(events) = full_events {
+        // Check if cache_ready was fired, and if so, flush guild subscriptions
+        #[cfg(feature = "cache")]
+        if matches!(events.1, Some(FullEvent::CacheReady { .. })) {
+            debug!("cache_ready fired, flushing guild subscriptions");
+            use crate::gateway::ShardRunnerMessage;
+            context.shard.send_to_shard(ShardRunnerMessage::FlushGuildSubscriptions);
+        }
+
         let iter = std::iter::once(events.0).chain(events.1);
         for handler in event_handlers {
             for event in iter.clone() {
@@ -172,12 +180,34 @@ fn update_cache_with_event(
 
             #[cfg(feature = "cache")]
             {
-                if cache.unavailable_guilds.len() == 0 {
+                // Subscribe to available guilds automatically if not unavailable
+                // Skip if already subscribed from Ready event
+                if !event.guild.unavailable && !cache.guild_subscriptions.is_pending_subscribe(event.guild.id) {
+                    // Queue subscription for this guild
+                    debug!("Queueing subscription for guild {}", event.guild.id);
+                    if let Err(e) = cache.guild_subscriptions.subscribe_to(
+                        event.guild.id,
+                        Some(true),  // typing
+                        Some(true),  // threads
+                        Some(true),  // activities
+                        None,        // member_updates
+                    ) {
+                        debug!("Failed to queue subscription for guild {}: {}", event.guild.id, e);
+                    }
+                }
+
+                // Check if all guilds have been received (no more unavailable)
+                let mut shards = cache.shard_data.write();
+                if cache.unavailable_guilds.len() == 0 && !shards.has_sent_cache_ready {
+                    shards.has_sent_cache_ready = true;
+                    drop(shards);
+                    debug!("All guilds received, firing cache_ready");
                     cache.unavailable_guilds.shrink_to_fit();
 
                     let guild_amount =
                         cache.guilds.iter().map(|i| *i.key()).collect::<Vec<GuildId>>();
 
+                    // Fire cache_ready event
                     extra_event = Some(FullEvent::CacheReady {
                         guilds: guild_amount,
                     });
@@ -342,6 +372,12 @@ fn update_cache_with_event(
             removed_reactions: event.reaction,
         },
         Event::Ready(mut event) => {
+            #[cfg(feature = "cache")]
+            let guilds_to_subscribe: Vec<GuildId> = event.ready.guilds.iter()
+                .filter(|g| !g.unavailable)
+                .map(|g| g.id)
+                .collect();
+
             update_cache!(cache, event);
 
             #[cfg(feature = "cache")]
@@ -354,6 +390,36 @@ fn update_cache_with_event(
 
                     extra_event = Some(FullEvent::ShardsReady {
                         total_shards: total,
+                    });
+                }
+
+                // Subscribe to guilds that are not unavailable (small guilds <75k members)
+                // These guilds don't send GUILD_CREATE events
+                for guild_id in guilds_to_subscribe {
+                    debug!("Queueing subscription for guild {} from Ready", guild_id);
+                    if let Err(e) = cache.guild_subscriptions.subscribe_to(
+                        guild_id,
+                        Some(true),  // typing
+                        Some(true),  // threads
+                        Some(true),  // activities
+                        None,        // member_updates
+                    ) {
+                        debug!("Failed to queue subscription for guild {}: {}", guild_id, e);
+                    }
+                }
+
+                // Fire cache_ready if there are no unavailable guilds
+                // (all guilds are small and already in Ready)
+                let mut shards = cache.shard_data.write();
+                if cache.unavailable_guilds.len() == 0 && !shards.has_sent_cache_ready {
+                    shards.has_sent_cache_ready = true;
+                    drop(shards);
+                    debug!("All guilds ready, firing cache_ready from Ready event");
+                    let guild_amount =
+                        cache.guilds.iter().map(|i| *i.key()).collect::<Vec<GuildId>>();
+
+                    extra_event = Some(FullEvent::CacheReady {
+                        guilds: guild_amount,
                     });
                 }
             }
