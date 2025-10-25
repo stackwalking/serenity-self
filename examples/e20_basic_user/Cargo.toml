@@ -1,0 +1,13 @@
+[package]
+name = "e20_basic_user"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serenity = { path = "../../", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "cache"] }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = "0.3.20"
+tracing = "0.1.41"
+twocaptcha = "0.0.3"
+dotenv = "0.15.0"
+base64 = "0.22.1"
